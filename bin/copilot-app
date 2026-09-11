@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+GITHUB_APP_CLIENT_ID="${GITHUB_APP_CLIENT_ID:-Iv23lihf8LwdWK3Znbk4}"
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/copilot-app-auth"
+token_file="$state_dir/tokens.json"
+lock_file="$state_dir/session.lock"
+
+umask 077
+mkdir -p "$state_dir"
+
+for dependency in copilot curl flock jq; do
+  if ! command -v "$dependency" >/dev/null 2>&1; then
+    printf 'Required command not found: %s\n' "$dependency" >&2
+    exit 1
+  fi
+done
+
+# Serialize sessions because refreshing a user token invalidates the previous
+# access token. The outer flock process retains the lock while Copilot runs.
+if [[ "${COPILOT_APP_LOCKED:-}" != "1" ]]; then
+  exec flock --close "$lock_file" \
+    env COPILOT_APP_LOCKED=1 "$0" "$@"
+fi
+
+fail_response() {
+  local message="$1"
+  local response="$2"
+
+  printf '%s\n' "$message" >&2
+  jq -r '.error_description // .error // "Unknown GitHub response"' \
+    <<<"$response" >&2 || true
+  exit 1
+}
+
+save_refresh_token() {
+  local response="$1"
+  local temporary_file
+
+  if ! jq -e '.refresh_token | strings | startswith("ghr_")' \
+    >/dev/null <<<"$response"; then
+    fail_response \
+      "GitHub did not return a refresh token. Ensure user-to-server token expiration is enabled." \
+      "$response"
+  fi
+
+  temporary_file=$(mktemp "$state_dir/tokens.XXXXXX")
+  if ! jq '{refresh_token, refresh_token_expires_in}' \
+    <<<"$response" >"$temporary_file" ||
+    ! chmod 600 "$temporary_file" ||
+    ! mv -f "$temporary_file" "$token_file"; then
+    rm -f "$temporary_file"
+    printf 'Could not securely save the rotated refresh token.\n' >&2
+    exit 1
+  fi
+}
+
+urlencode() {
+  jq -sRr @uri
+}
+
+oauth_request() {
+  local body="$1"
+
+  printf '%s' "$body" |
+    curl --fail --silent --show-error \
+      --request POST \
+      --header 'Accept: application/json' \
+      --header 'Content-Type: application/x-www-form-urlencoded' \
+      --data-binary @- \
+      https://github.com/login/oauth/access_token
+}
+
+authorize_device() {
+  local response device_code user_code verification_uri
+  local interval expires_in deadline error access_token
+
+  response=$(
+    curl --fail --silent --show-error \
+      --request POST \
+      --header 'Accept: application/json' \
+      --data-urlencode "client_id=$GITHUB_APP_CLIENT_ID" \
+      https://github.com/login/device/code
+  )
+
+  device_code=$(jq -er '.device_code' <<<"$response")
+  user_code=$(jq -er '.user_code' <<<"$response")
+  verification_uri=$(jq -er '.verification_uri' <<<"$response")
+  interval=$(jq -er '.interval' <<<"$response")
+  expires_in=$(jq -er '.expires_in' <<<"$response")
+  deadline=$((SECONDS + expires_in))
+
+  printf 'Open %s and enter code: %s\n' \
+    "$verification_uri" "$user_code" >&2
+
+  while ((SECONDS < deadline)); do
+    sleep "$interval"
+
+    response=$(
+      oauth_request \
+        "client_id=$(printf '%s' "$GITHUB_APP_CLIENT_ID" | urlencode)&device_code=$(printf '%s' "$device_code" | urlencode)&grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Adevice_code"
+    )
+
+    access_token=$(jq -r '.access_token // empty' <<<"$response")
+    if [[ "$access_token" == ghu_* ]]; then
+      save_refresh_token "$response"
+      printf '%s\n' "$access_token"
+      return
+    fi
+
+    error=$(jq -r '.error // empty' <<<"$response")
+    case "$error" in
+      authorization_pending)
+        ;;
+      slow_down)
+        interval=$(jq -r --argjson fallback "$((interval + 5))" \
+          '.interval // $fallback' <<<"$response")
+        ;;
+      *)
+        fail_response "GitHub device authorization failed." "$response"
+        ;;
+    esac
+  done
+
+  printf 'GitHub device authorization expired; run the command again.\n' >&2
+  exit 1
+}
+
+refresh_access_token() {
+  local refresh_token encoded_refresh_token response access_token
+
+  refresh_token=$(jq -er '.refresh_token' "$token_file")
+  encoded_refresh_token=$(printf '%s' "$refresh_token" | urlencode)
+
+  response=$(
+    oauth_request \
+      "client_id=$(printf '%s' "$GITHUB_APP_CLIENT_ID" | urlencode)&grant_type=refresh_token&refresh_token=$encoded_refresh_token"
+  )
+
+  access_token=$(jq -r '.access_token // empty' <<<"$response")
+  if [[ "$access_token" != ghu_* ]]; then
+    fail_response \
+      "Could not refresh the GitHub App user access token. Remove $token_file and authorize again." \
+      "$response"
+  fi
+
+  save_refresh_token "$response"
+  printf '%s\n' "$access_token"
+}
+
+if [[ -f "$token_file" ]]; then
+  access_token=$(refresh_access_token)
+else
+  access_token=$(authorize_device)
+fi
+
+COPILOT_GITHUB_TOKEN="$access_token" exec copilot "$@"
