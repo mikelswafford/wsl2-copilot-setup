@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Wraps the `gh` CLI so every invocation authenticates as a GitHub App
+# installation, rather than any personal account.
+set -euo pipefail
+
+for command_name in gh python3 timeout; do
+  if ! command -v "$command_name" >/dev/null 2>&1; then
+    printf 'Required command not found: %s\n' "$command_name" >&2
+    exit 1
+  fi
+done
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+token=$(timeout --signal=TERM --kill-after=5s 30s python3 "$script_dir/get-github-app-token.py")
+
+if [[ "$token" != ghs_* || "$token" =~ [[:space:]] ]]; then
+  printf 'get-github-app-token.py did not return an installation token.\n' >&2
+  exit 1
+fi
+
+export GH_TOKEN="$token"
+unset token
+
+exec gh "$@"
