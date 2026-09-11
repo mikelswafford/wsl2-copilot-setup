@@ -1,0 +1,5 @@
+# Never commit instance-specific secrets or state.
+*.pem
+*.key
+tokens.json
+.env
